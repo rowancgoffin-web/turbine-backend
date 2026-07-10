@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+wind-stats>=0.3.0
+xarray>=2024.1.0
+scipy>=1.10
+requests>=2.31
