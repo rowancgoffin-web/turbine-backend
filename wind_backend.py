@@ -275,7 +275,15 @@ async def site_elevation(
     lat: float = Query(..., ge=-90, le=90),
     lon: float = Query(..., ge=-180, le=180),
 ):
-    key = f"{round(lat * 100) / 100}_{round(lon * 100) / 100}"
+    # Cache at 4 decimal places (~11 m). The previous 2-dp key (~0.7-1.1 km)
+    # caused turbines within ~1 km of each other to SHARE one cache slot: whichever
+    # turbine's request completed first had its terrain/elevation result served to
+    # its neighbours, race-dependent across reloads. Found via a user bug report
+    # where two turbines 537 m apart swapped elevation values between sessions,
+    # moving gross yield ~2%. Elevation is point data — unlike the wind-resource
+    # cache (deliberately coarse to match NASA POWER's ~50 km grid), it must not
+    # be shared between distinct turbine positions.
+    key = f"{round(lat * 10000) / 10000}_{round(lon * 10000) / 10000}"
     cached = _elevation_cache.get(key)
     if cached and (time.time() - cached["fetched_at"]) < CACHE_TTL_SECONDS:
         return cached["result"]
@@ -391,7 +399,10 @@ def wind_rose(
     if not WIND_STATS_AVAILABLE:
         raise HTTPException(status_code=501, detail="wind-stats package not installed on this backend")
 
-    key = f"{round(lat * 4) / 4}_{round(lon * 4) / 4}_{hub_height}_{roughness}"
+    # 4-dp key (~11 m): GWA GWC data has ~250 m effective resolution, so the
+    # previous 0.25-degree (~28 km) rounding could serve one site centre's rose
+    # to a different site tens of km away.
+    key = f"{round(lat * 10000) / 10000}_{round(lon * 10000) / 10000}_{hub_height}_{roughness}"
     cached = _rose_cache.get(key)
     if cached and (time.time() - cached["fetched_at"]) < CACHE_TTL_SECONDS:
         return cached["result"]
