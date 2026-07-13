@@ -29,11 +29,21 @@ import time
 
 app = FastAPI(title="Wind Resource API")
 
-# Allow the frontend (running on any origin, e.g. file:// or your deployed domain)
-# to call this API directly from the browser.
+# CORS restricted to the deployed frontend (plus localhost for development).
+# The previous wildcard let any website on the internet call this API from
+# their visitors' browsers, burning the free-tier quota. Note this only stops
+# browser-based cross-origin use — direct curl/script access is unaffected
+# (that would need auth or rate limiting, deliberately not added at this scale).
+# If the frontend moves to a custom domain, add it here and redeploy.
+ALLOWED_ORIGINS = [
+    "https://gorgeous-swan-134cb1.netlify.app",
+    "http://localhost:8000",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET"],
     allow_headers=["*"],
 )
@@ -45,6 +55,16 @@ NASA_POWER_URL = "https://power.larc.nasa.gov/api/temporal/climatology/point"
 # degrees (roughly the native grid resolution) plus hub height.
 _cache: dict[str, dict] = {}
 CACHE_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days — this data is climatological, it won't go stale fast
+CACHE_MAX_ENTRIES = 5000  # simple insurance against unbounded growth on a long-lived process
+
+
+def _cache_put(cache: dict, key: str, value: dict) -> None:
+    """Insert with a crude size cap: evict the oldest ~20% when full. FIFO is
+    fine here — entries are climatological and cheap to refetch."""
+    if len(cache) >= CACHE_MAX_ENTRIES:
+        for k in list(cache.keys())[: CACHE_MAX_ENTRIES // 5]:
+            del cache[k]
+    cache[key] = value
 
 
 def _cache_key(lat: float, lon: float, hub_height: float, alpha: float) -> str:
@@ -193,7 +213,7 @@ async def wind_resource(
         "note": "Screening-grade estimate. Not terrain-corrected — a real ridge or valley "
                 "at this exact point could differ meaningfully from this grid-cell average.",
     }
-    _cache[key] = {"result": result, "fetched_at": time.time()}
+    _cache_put(_cache, key, {"result": result, "fetched_at": time.time()})
     return result
 
 
@@ -354,7 +374,7 @@ async def site_elevation(
                 "physics WAsP's orographic model uses — a real improvement over no terrain correction at all, "
                 "but not equivalent to a full WAsP/CFD terrain assessment. See METHODOLOGY.md §11.",
     }
-    _elevation_cache[key] = {"result": result, "fetched_at": time.time()}
+    _cache_put(_elevation_cache, key, {"result": result, "fetched_at": time.time()})
     return result
 
 
@@ -428,5 +448,5 @@ def wind_rose(
         "weibull_k": weibull_k,
         "source": "Global Wind Atlas v3 GWC (generalized wind climate, not terrain-corrected at this exact point)",
     }
-    _rose_cache[key] = {"result": result, "fetched_at": time.time()}
+    _cache_put(_rose_cache, key, {"result": result, "fetched_at": time.time()})
     return result
