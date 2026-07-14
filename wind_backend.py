@@ -49,6 +49,7 @@ app.add_middleware(
 )
 
 NASA_POWER_URL = "https://power.larc.nasa.gov/api/temporal/climatology/point"
+NASA_POWER_MONTHLY_URL = "https://power.larc.nasa.gov/api/temporal/monthly/point"
 
 # Simple in-memory cache: wind data doesn't change, so no need to hit NASA's
 # servers repeatedly for the same location. Keyed by lat/lon rounded to 0.25
@@ -214,6 +215,76 @@ async def wind_resource(
                 "at this exact point could differ meaningfully from this grid-cell average.",
     }
     _cache_put(_cache, key, {"result": result, "fetched_at": time.time()})
+    return result
+
+
+_iav_cache: dict = {}
+
+
+@app.get("/api/iav")
+async def interannual_variability(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+):
+    """
+    Interannual variability source data: year-by-year annual mean 50m wind
+    speeds from NASA POWER's monthly time series (MERRA-2 derived, ~50 km
+    grid). Returns the raw annual means; the frontend detrends the series
+    and converts wind variability to energy variability through the active
+    power-curve pipeline. IAV is a synoptic-scale (regional) quantity, so
+    the cache key is deliberately coarse (0.25 deg), matching the
+    wind-resource cache — one fetch typically covers a whole site.
+    Years with any missing months are skipped rather than patched.
+    """
+    key = f"{round(lat * 4) / 4}_{round(lon * 4) / 4}"
+    cached = _iav_cache.get(key)
+    if cached and (time.time() - cached["fetched_at"] < CACHE_TTL_SECONDS):
+        return cached["result"]
+
+    params = {
+        "parameters": "WS50M",
+        "community": "RE",
+        "longitude": lon,
+        "latitude": lat,
+        "start": "1984",
+        "end": "2024",
+        "format": "JSON",
+    }
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        resp = await client.get(NASA_POWER_MONTHLY_URL, params=params)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="NASA POWER monthly API request failed")
+        data = resp.json()
+
+    try:
+        block = data["properties"]["parameter"]["WS50M"]
+    except (KeyError, TypeError):
+        raise HTTPException(status_code=502, detail="Unexpected response shape from NASA POWER monthly API")
+
+    # Keys are YYYYMM strings; NASA POWER uses month "13" for the year's
+    # annual value, which we ignore, computing annual means ourselves so a
+    # year with any missing month (-999 fill value) can be skipped cleanly.
+    by_year: dict = {}
+    for k, v in block.items():
+        if len(k) != 6:
+            continue
+        year, month = k[:4], k[4:6]
+        if month == "13":
+            continue
+        by_year.setdefault(year, []).append(float(v))
+
+    years, annual_means = [], []
+    for year in sorted(by_year.keys()):
+        months = by_year[year]
+        if len(months) == 12 and all(m > -100 for m in months):
+            years.append(int(year))
+            annual_means.append(sum(months) / 12.0)
+
+    if len(annual_means) < 10:
+        raise HTTPException(status_code=502, detail="Insufficient complete years in NASA POWER monthly record")
+
+    result = {"years": years, "annual_means_50m": [round(v, 4) for v in annual_means], "n_years": len(years)}
+    _cache_put(_iav_cache, key, {"result": result, "fetched_at": time.time()})
     return result
 
 
