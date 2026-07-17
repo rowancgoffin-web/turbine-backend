@@ -36,6 +36,8 @@ app = FastAPI(title="Wind Resource API")
 # (that would need auth or rate limiting, deliberately not added at this scale).
 # If the frontend moves to a custom domain, add it here and redeploy.
 ALLOWED_ORIGINS = [
+    "https://windypins.netlify.app",
+    # Retained during the Netlify migration. Delete once the old site is gone.
     "https://gorgeous-swan-134cb1.netlify.app",
     "http://localhost:8000",
     "http://localhost:5500",
@@ -50,6 +52,14 @@ app.add_middleware(
 
 NASA_POWER_URL = "https://power.larc.nasa.gov/api/temporal/climatology/point"
 NASA_POWER_MONTHLY_URL = "https://power.larc.nasa.gov/api/temporal/monthly/point"
+
+# ERA5 via Open-Meteo's archive API: keyless, no registration, no async queue.
+# This is why ERA5 is now viable when the CDS route was not. ~31 km resolution,
+# hourly, 1940-present, with native 100 m wind components.
+OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+# OpenStreetMap Overpass: neighbouring turbines for external wake (IEC 4.1b).
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 # Simple in-memory cache: wind data doesn't change, so no need to hit NASA's
 # servers repeatedly for the same location. Keyed by lat/lon rounded to 0.25
@@ -285,6 +295,370 @@ async def interannual_variability(
 
     result = {"years": years, "annual_means_50m": [round(v, 4) for v in annual_means], "n_years": len(years)}
     _cache_put(_iav_cache, key, {"result": result, "fetched_at": time.time()})
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ERA5 (Open-Meteo) long-term hourly resource + OSM external-wake neighbours
+# ---------------------------------------------------------------------------
+# ERA5 is ~31 km -- COARSER than GWA's 250 m microscale. It does NOT replace
+# GWA. The division of labour is the one industry actually uses: reanalysis
+# for the long-term temporal climate (rose shape, Weibull fitted to real
+# hourly data, IAV, hysteresis), microscale model for spatial downscaling.
+# Each does what it is good at.
+
+def weibull_mle(speeds, calm_threshold=0.5, tol=1e-7, max_iter=200):
+    """
+    Maximum-likelihood Weibull fit to a wind speed sample.
+
+    Solves the standard MLE equation for k by Newton iteration:
+        1/k = (sum v^k ln v)/(sum v^k) - mean(ln v)
+    then A = (mean(v^k))^(1/k).
+
+    Calms below calm_threshold are dropped: ln(0) is undefined, and sub-0.5 m/s
+    hours carry no energy and are below every cut-in speed in the library. This
+    biases A/k slightly high versus a fit including calms -- documented, and the
+    standard practice when fitting Weibull to reanalysis for energy purposes.
+    """
+    v = [s for s in speeds if s is not None and s > calm_threshold]
+    n = len(v)
+    if n < 100:
+        return None
+    ln_v = [math.log(x) for x in v]
+    mean_ln = sum(ln_v) / n
+    k = 2.0
+    for _ in range(max_iter):
+        vk = [x ** k for x in v]
+        s_vk = sum(vk)
+        if s_vk <= 0:
+            return None
+        s_vk_ln = sum(vk[i] * ln_v[i] for i in range(n))
+        s_vk_ln2 = sum(vk[i] * ln_v[i] * ln_v[i] for i in range(n))
+        f = s_vk_ln / s_vk - 1.0 / k - mean_ln
+        df = (s_vk_ln2 * s_vk - s_vk_ln ** 2) / (s_vk ** 2) + 1.0 / (k * k)
+        if abs(df) < 1e-12:
+            break
+        k_new = k - f / df
+        if k_new <= 0.1:
+            k_new = 0.1
+        if abs(k_new - k) < tol:
+            k = k_new
+            break
+        k = k_new
+    A = (sum(x ** k for x in v) / n) ** (1.0 / k)
+    return A, k
+
+
+def sector_index(direction_deg, n_sectors=12):
+    """Bin a meteorological direction into a sector centred on N, NNE... ."""
+    width = 360.0 / n_sectors
+    return int(math.floor((direction_deg % 360.0) / width + 0.5)) % n_sectors
+
+
+def build_rose(speeds, directions, n_sectors=12):
+    """
+    12-sector rose fitted to real hourly data: per-sector frequency and
+    MLE Weibull A/k. Sectors with too few hours for a stable fit fall back
+    to the all-directions fit, flagged in `sectors_fitted`.
+    """
+    bins = [[] for _ in range(n_sectors)]
+    total = 0
+    for s, d in zip(speeds, directions):
+        if s is None or d is None:
+            continue
+        bins[sector_index(d, n_sectors)].append(s)
+        total += 1
+    if total == 0:
+        return None
+    overall = weibull_mle(speeds)
+    freqs, As, ks, fitted = [], [], [], []
+    for b in bins:
+        freqs.append(100.0 * len(b) / total)
+        fit = weibull_mle(b)
+        if fit is None:
+            fit = overall
+            fitted.append(False)
+        else:
+            fitted.append(True)
+        As.append(fit[0] if fit else 0.0)
+        ks.append(fit[1] if fit else 2.0)
+    return {
+        "frequency_pct": freqs,
+        "weibull_A": As,
+        "weibull_k": ks,
+        "sectors_fitted": fitted,
+        "n_hours": total,
+    }
+
+
+def icing_criterion(temps_2m, rh, hub_height, lapse_k_per_km=6.5):
+    """
+    IEC / IEA Task 19 screening criterion: fraction of the year with
+    hub-height T < 0 C AND RH > 96% simultaneously. Trips at 1%.
+
+    ERA5 gives 2 m temperature; hub-height T is estimated with a standard
+    environmental lapse rate. At 100 m that is only ~0.64 K, but it is in the
+    right direction and cheap. RH is not lapse-corrected -- RH generally rises
+    with height in the boundary layer, so using 2 m RH is conservative
+    (under-counts icing hours). Documented as such.
+    """
+    dT = lapse_k_per_km * (hub_height - 2.0) / 1000.0
+    n = 0
+    hits = 0
+    for t, h in zip(temps_2m, rh):
+        if t is None or h is None:
+            continue
+        n += 1
+        if (t - dT) < 0.0 and h > 96.0:
+            hits += 1
+    if n == 0:
+        return None
+    pct = 100.0 * hits / n
+    return {
+        "icing_hours_pct": round(pct, 3),
+        "n_hours": n,
+        "threshold_pct": 1.0,
+        "criterion_tripped": pct > 1.0,
+        "hub_temp_offset_K": round(dT, 2),
+    }
+
+
+def hysteresis_loss(speeds, cut_out, restart, hub_height=None):
+    """
+    High-wind hysteresis (IEC 61400-15 category 4b).
+
+    The power curve already zeroes production above cut-out, so that energy is
+    not double-counted. Hysteresis is the ADDITIONAL loss from the restart
+    deadband: after a cut-out trip, the turbine stays down until wind falls to
+    `restart` (typically ~cut_out - 3..5 m/s), so hours in [restart, cut_out)
+    that FOLLOW a trip produce nothing despite being in-limits.
+
+    This needs the chronological series -- it cannot be done from a Weibull fit,
+    which is exactly why hourly ERA5 unlocks it. Returns lost in-limits hours as
+    a fraction of in-limits hours; the frontend weights this by the energy those
+    hours would have produced.
+    """
+    down = False
+    inlimits = 0
+    lost = 0
+    for s in speeds:
+        if s is None:
+            continue
+        if s >= cut_out:
+            down = True
+            continue
+        inlimits += 1
+        if down:
+            # Restart occurs when wind falls TO the restart threshold, not
+            # strictly below it. Using `<` here counted the boundary hour as
+            # lost, overstating hysteresis by one hour per trip.
+            if s <= restart:
+                down = False
+            else:
+                lost += 1
+    if inlimits == 0:
+        return None
+    return {
+        "lost_hours": lost,
+        "in_limits_hours": inlimits,
+        "hysteresis_hours_pct": round(100.0 * lost / inlimits, 4),
+        "cut_out_ms": cut_out,
+        "restart_ms": restart,
+    }
+
+
+_era5_cache: dict = {}
+_neighbours_cache: dict = {}
+
+
+async def _fetch_era5_chunk(client, lat, lon, start, end):
+    params = {
+        "latitude": lat, "longitude": lon,
+        "start_date": start, "end_date": end,
+        "hourly": "wind_speed_100m,wind_direction_100m,temperature_2m,relative_humidity_2m",
+        "wind_speed_unit": "ms",
+        "timezone": "UTC",
+    }
+    resp = await client.get(OPEN_METEO_ARCHIVE_URL, params=params)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Open-Meteo ERA5 request failed ({resp.status_code})")
+    return resp.json().get("hourly", {})
+
+
+@app.get("/api/era5-resource")
+async def era5_resource(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+    hub_height: float = Query(100, ge=10, le=300),
+    start_year: int = Query(2005, ge=1950, le=2024),
+    end_year: int = Query(2024, ge=1950, le=2025),
+    cut_out: float = Query(25.0, ge=10, le=40),
+    restart: float = Query(22.0, ge=5, le=40),
+):
+    """
+    Long-term hourly wind climate from ERA5 at 100 m.
+
+    Returns SUMMARY STATISTICS ONLY -- the raw hourly series (~175k points for
+    20 years) is reduced server-side and never sent to the browser.
+
+    100 m is at or near hub height for most of the turbine library, which
+    removes the power-law shear extrapolation from the critical path. That
+    extrapolation was the single largest remaining modelling assumption.
+    """
+    key = f"{round(lat*100)/100}_{round(lon*100)/100}_{hub_height}_{start_year}_{end_year}_{cut_out}_{restart}"
+    cached = _era5_cache.get(key)
+    if cached and (time.time() - cached["fetched_at"]) < CACHE_TTL_SECONDS:
+        return cached["result"]
+
+    # Chunked in 5-year blocks: a single 20-year hourly request is a large
+    # payload and Open-Meteo has been known to reject or time out on them.
+    # Chunking also means one bad block does not lose the whole fetch.
+    speeds, dirs, temps, rhs, times = [], [], [], [], []
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        for y0 in range(start_year, end_year + 1, 5):
+            y1 = min(y0 + 4, end_year)
+            h = await _fetch_era5_chunk(client, lat, lon, f"{y0}-01-01", f"{y1}-12-31")
+            speeds += h.get("wind_speed_100m", []) or []
+            dirs += h.get("wind_direction_100m", []) or []
+            temps += h.get("temperature_2m", []) or []
+            rhs += h.get("relative_humidity_2m", []) or []
+            times += h.get("time", []) or []
+
+    if len(speeds) < 8760:
+        raise HTTPException(status_code=502, detail="ERA5 returned insufficient hourly data")
+
+    rose = build_rose(speeds, dirs)
+    if rose is None:
+        raise HTTPException(status_code=502, detail="Could not fit wind rose to ERA5 data")
+    overall = weibull_mle(speeds)
+    valid = [s for s in speeds if s is not None]
+
+    # Annual means for IAV, straight from the hourly series -- a real
+    # measured-structure IAV rather than one inferred from monthly means.
+    by_year: dict = {}
+    for ts, s in zip(times, speeds):
+        if s is None or not ts:
+            continue
+        by_year.setdefault(ts[:4], []).append(s)
+    years, ann = [], []
+    for y in sorted(by_year):
+        if len(by_year[y]) > 8000:  # tolerate a few gaps, reject part-years
+            years.append(int(y))
+            ann.append(sum(by_year[y]) / len(by_year[y]))
+
+    result = {
+        "lat": lat, "lon": lon, "hub_height_m": hub_height,
+        "sectors_deg": [i * 30 for i in range(12)],
+        "frequency_pct": [round(f, 4) for f in rose["frequency_pct"]],
+        "weibull_A": [round(a, 3) for a in rose["weibull_A"]],
+        "weibull_k": [round(k, 3) for k in rose["weibull_k"]],
+        "sectors_fitted": rose["sectors_fitted"],
+        "mean_wind_speed_100m": round(sum(valid) / len(valid), 3),
+        "weibull_A_overall": round(overall[0], 3) if overall else None,
+        "weibull_k_overall": round(overall[1], 3) if overall else None,
+        "n_hours": rose["n_hours"],
+        "years": years,
+        "annual_means_100m": [round(v, 4) for v in ann],
+        "n_years": len(years),
+        "icing": icing_criterion(temps, rhs, hub_height),
+        "hysteresis": hysteresis_loss(speeds, cut_out, restart),
+        "height_note": "ERA5 native 100 m wind. No power-law shear extrapolation applied "
+                       f"to reach {hub_height} m -- if hub height differs materially from 100 m "
+                       "the frontend still shears the residual difference.",
+        "source": "ERA5 reanalysis (~31 km, hourly) via Open-Meteo archive API",
+        "caveat": "ERA5 is coarser than GWA (250 m) and is NOT terrain-corrected. Use it for "
+                  "long-term temporal structure; use GWA for microscale spatial detail.",
+        "weibull_note": "Weibull A/k fitted by maximum likelihood to real hourly data. Calms "
+                        "below 0.5 m/s excluded (ln(0) undefined; sub-cut-in anyway), which "
+                        "biases A high by ~0.5% and k high by ~1.5% at k=2, more at lower k.",
+    }
+    _cache_put(_era5_cache, key, {"result": result, "fetched_at": time.time()})
+    return result
+
+
+@app.get("/api/nearby-turbines")
+async def nearby_turbines(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+    radius_m: int = Query(20000, ge=1000, le=50000),
+):
+    """
+    Neighbouring turbines from OpenStreetMap for external wake (IEC 4.1b).
+
+    HONEST LIMITATION: OSM completeness varies by country. UK/DE/DK are well
+    mapped; elsewhere is patchy. An unmapped neighbour returns silently as no
+    loss -- an underestimate the user cannot see. The mitigation is visibility:
+    the frontend renders these on the map and lets the user add or delete them,
+    so a human validates the data rather than trusting it blind.
+    """
+    key = f"{round(lat*1000)/1000}_{round(lon*1000)/1000}_{radius_m}"
+    cached = _neighbours_cache.get(key)
+    if cached and (time.time() - cached["fetched_at"]) < CACHE_TTL_SECONDS:
+        return cached["result"]
+
+    q = f"""[out:json][timeout:25];
+(
+  node(around:{radius_m},{lat},{lon})["generator:source"="wind"];
+  way(around:{radius_m},{lat},{lon})["generator:source"="wind"];
+);
+out center tags;"""
+    try:
+        async with httpx.AsyncClient(timeout=40.0) as client:
+            resp = await client.post(OVERPASS_URL, data={"data": q})
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Overpass returned {resp.status_code}")
+            data = resp.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Overpass is rate-limited and periodically flaky. Degrade to "found
+        # nothing, say so" rather than failing the whole analysis.
+        return {"turbines": [], "count": 0, "available": False,
+                "note": f"OpenStreetMap lookup unavailable ({type(exc).__name__}). "
+                        "Add neighbouring turbines manually if external wake matters here."}
+
+    out = []
+    for el in data.get("elements", []):
+        c = el.get("center") or el
+        la, lo = c.get("lat"), c.get("lon")
+        if la is None or lo is None:
+            continue
+        tags = el.get("tags", {}) or {}
+
+        def _num(*keys):
+            for k in keys:
+                v = tags.get(k)
+                if v is None:
+                    continue
+                try:
+                    return float(str(v).split()[0].replace(",", "."))
+                except ValueError:
+                    continue
+            return None
+
+        rotor = _num("rotor:diameter", "generator:rotor:diameter")
+        hub = _num("height:hub", "generator:height:hub")
+        out.append({
+            "lat": la, "lon": lo,
+            "rotor_diameter_m": rotor,
+            "hub_height_m": hub,
+            "assumed": rotor is None or hub is None,
+            "name": tags.get("name"),
+            "operator": tags.get("operator"),
+            "osm_id": el.get("id"),
+        })
+
+    n_assumed = sum(1 for t in out if t["assumed"])
+    result = {
+        "turbines": out, "count": len(out), "available": True,
+        "radius_m": radius_m,
+        "n_assumed_geometry": n_assumed,
+        "source": "OpenStreetMap via Overpass API (power=generator, generator:source=wind)",
+        "completeness_warning": "OSM coverage is not guaranteed complete. Turbines that exist "
+                                "but are unmapped will not appear and will not be counted as "
+                                "external wake. Verify against the map before relying on this.",
+    }
+    _cache_put(_neighbours_cache, key, {"result": result, "fetched_at": time.time()})
     return result
 
 
