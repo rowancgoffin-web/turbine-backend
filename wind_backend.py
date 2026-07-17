@@ -59,7 +59,12 @@ NASA_POWER_MONTHLY_URL = "https://power.larc.nasa.gov/api/temporal/monthly/point
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 # OpenStreetMap Overpass: neighbouring turbines for external wake (IEC 4.1b).
+# Public Overpass instances filter requests without an identifying
+# User-Agent (hence 406s from library-default UAs), and OSM usage policy
+# requires one regardless. A mirror is tried before giving up.
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_MIRROR_URL = "https://overpass.kumi.systems/api/interpreter"
+OVERPASS_HEADERS = {"User-Agent": "windypins-backend/1.0 (+https://windypins.netlify.app)"}
 
 # Simple in-memory cache: wind data doesn't change, so no need to hit NASA's
 # servers repeatedly for the same location. Keyed by lat/lon rounded to 0.25
@@ -496,14 +501,19 @@ async def era5_resource(
     restart: float = Query(22.0, ge=5, le=40),
 ):
     """
-    Long-term hourly wind climate from ERA5 at 100 m.
+    Long-term hourly ERA5 statistics: IAV, icing criterion, hysteresis.
 
     Returns SUMMARY STATISTICS ONLY -- the raw hourly series (~175k points for
     20 years) is reduced server-side and never sent to the browser.
 
-    100 m is at or near hub height for most of the turbine library, which
-    removes the power-law shear extrapolation from the critical path. That
-    extrapolation was the single largest remaining modelling assumption.
+    VALIDATION NOTE (July 2026): ERA5 was tested as a full resource baseline
+    against London Array (+9% on A) and Braes of Doune (-16% on A). The ~31 km
+    cell smooths terrain, making it unusable for onshore resource -- GWA
+    remains the resource path. ERA5 is used here only for quantities where
+    synoptic-scale data is appropriate: interannual variability, the IEC
+    icing screening criterion, and (offshore only) high-wind hysteresis.
+    The rose/Weibull fields are retained for diagnostics and comparison,
+    NOT as the production resource input.
     """
     key = f"{round(lat*100)/100}_{round(lon*100)/100}_{hub_height}_{start_year}_{end_year}_{cut_out}_{restart}"
     cached = _era5_cache.get(key)
@@ -562,9 +572,14 @@ async def era5_resource(
         "n_years": len(years),
         "icing": icing_criterion(temps, rhs, hub_height),
         "hysteresis": hysteresis_loss(speeds, cut_out, restart),
-        "height_note": "ERA5 native 100 m wind. No power-law shear extrapolation applied "
-                       f"to reach {hub_height} m -- if hub height differs materially from 100 m "
-                       "the frontend still shears the residual difference.",
+        "hysteresis_note": "Validated for offshore/flat terrain only. ERA5's ~31 km cell "
+                           "smooths terrain-accelerated gusts: at Braes of Doune (400 m upland "
+                           "ridge) it reports zero hours above cut-out, which is a resolution "
+                           "artefact, not a site property. Onshore complex-terrain sites should "
+                           "treat 0.1-0.5% as the IEC-typical band and enter 4b manually.",
+        "role_note": "Diagnostic/temporal data source. NOT the resource baseline: "
+                     "validation against two UK farms showed ERA5 terrain smoothing of "
+                     "-16% on wind speed at an upland site. GWA remains the resource path.",
         "source": "ERA5 reanalysis (~31 km, hourly) via Open-Meteo archive API",
         "caveat": "ERA5 is coarser than GWA (250 m) and is NOT terrain-corrected. Use it for "
                   "long-term temporal structure; use GWA for microscale spatial detail.",
@@ -602,19 +617,25 @@ async def nearby_turbines(
   way(around:{radius_m},{lat},{lon})["generator:source"="wind"];
 );
 out center tags;"""
-    try:
-        async with httpx.AsyncClient(timeout=40.0) as client:
-            resp = await client.post(OVERPASS_URL, data={"data": q})
-            if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Overpass returned {resp.status_code}")
-            data = resp.json()
-    except HTTPException:
-        raise
-    except Exception as exc:
+    data = None
+    last_err = "no response"
+    async with httpx.AsyncClient(timeout=40.0, headers=OVERPASS_HEADERS) as client:
+        for url in (OVERPASS_URL, OVERPASS_MIRROR_URL):
+            try:
+                resp = await client.post(url, data={"data": q})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    break
+                last_err = f"HTTP {resp.status_code} from {url.split('/')[2]}"
+            except Exception as exc:
+                last_err = f"{type(exc).__name__} from {url.split('/')[2]}"
+    if data is None:
         # Overpass is rate-limited and periodically flaky. Degrade to "found
-        # nothing, say so" rather than failing the whole analysis.
+        # nothing, say so" rather than failing the whole analysis. This must
+        # NOT raise: an external-wake lookup failure is a data gap, not an
+        # analysis failure.
         return {"turbines": [], "count": 0, "available": False,
-                "note": f"OpenStreetMap lookup unavailable ({type(exc).__name__}). "
+                "note": f"OpenStreetMap lookup unavailable ({last_err}). "
                         "Add neighbouring turbines manually if external wake matters here."}
 
     out = []
